@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  math-exercise-assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: math-exercise-assistant
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PROBLEM_GENERATOR_MODEL=google/flan-t5-base
+      - EXPLANATION_MODEL=google/flan-t5-large
+    restart: unless-stopped
