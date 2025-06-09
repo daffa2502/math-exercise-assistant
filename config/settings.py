@@ -19,6 +19,9 @@ MODELS_DIR.mkdir(exist_ok=True)
 PROBLEM_GENERATOR_MODEL = os.getenv("PROBLEM_GENERATOR_MODEL", "google/flan-t5-base")
 EXPLANATION_MODEL = os.getenv("EXPLANATION_MODEL", "google/flan-t5-large")
 
+# Mock mode setting - set to True to run without loading models
+MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
+
 # Application settings
 DEFAULT_NUM_PROBLEMS = 5
 DEFAULT_DIFFICULTY = "medium"  # easy, medium, hard

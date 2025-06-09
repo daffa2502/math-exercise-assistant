@@ -16,7 +16,10 @@ class MathExplainer:
     """
 
     def __init__(
-        self, model_name: str = EXPLANATION_MODEL, device: Optional[str] = None
+        self,
+        model_name: str = EXPLANATION_MODEL,
+        device: Optional[str] = None,
+        mock_mode: bool = False,
     ):
         """
         Initialize the math explainer with the specified model.
@@ -24,7 +27,18 @@ class MathExplainer:
         Args:
             model_name: Hugging Face model name/path
             device: Device to run the model on ('cuda', 'cpu', etc.)
+            mock_mode: If True, skip model loading and use fallback explanations
         """
+        self.mock_mode = mock_mode
+
+        if mock_mode:
+            logger.info(
+                "Running explanation model in mock mode - no models will be loaded"
+            )
+            self.tokenizer = None
+            self.model = None
+            return
+
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
@@ -53,6 +67,9 @@ class MathExplainer:
         Returns:
             A detailed explanation addressing the user's query
         """
+        if self.mock_mode:
+            return self._create_fallback_explanation(problem_data, user_query)
+
         # Extract problem content
         problem = problem_data["problem"]
         original_explanation = problem_data["explanation"]
@@ -117,3 +134,37 @@ class MathExplainer:
                 cleaned_lines.append(line)
 
         return "\n".join(cleaned_lines) if cleaned_lines else output_text
+
+    def _create_fallback_explanation(
+        self, problem_data: Dict[str, Any], user_query: str
+    ) -> str:
+        """Create a fallback explanation when in mock mode"""
+        problem = problem_data["problem"]
+        solution = problem_data["solution"]
+        topic = problem_data.get("metadata", {}).get("topic", "math")
+
+        return f"""**Additional Explanation (Mock Mode)**
+
+You asked: "{user_query}"
+
+Here's a more detailed breakdown of the problem: {problem}
+
+The solution is: {solution}
+
+This is a {topic} problem. In mock mode, I can provide some general guidance:
+
+**Key steps for solving {topic} problems:**
+- Always read the problem carefully and identify what you're looking for
+- Write down what information is given
+- Apply the appropriate formulas or methods for this topic
+- Show your work step by step
+- Check your answer by substituting back or using alternative methods
+
+**Common mistakes to avoid:**
+- Rushing through calculations
+- Forgetting to apply order of operations
+- Not checking units in word problems
+- Making sign errors in algebra
+
+This is a generated explanation in mock mode. In the full version, the AI model would provide a more personalized and detailed explanation based on your specific question.
+"""

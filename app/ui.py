@@ -7,6 +7,7 @@ from config.settings import (
     DEFAULT_TIME_MINUTES,
     DEFAULT_TOPIC,
     DIFFICULTY_LEVELS,
+    MOCK_MODE,
 )
 from models.explanation_model import MathExplainer
 from models.problem_generator import MathProblemGenerator
@@ -91,6 +92,12 @@ def home_page():
         unsafe_allow_html=True,
     )
 
+    # Show mock mode warning if enabled
+    if MOCK_MODE:
+        st.warning(
+            "🔧 **Running in Mock Mode** - No AI models will be loaded. Using template problems for testing."
+        )
+
     col1, col2 = st.columns(2)
 
     with col1:
@@ -154,7 +161,7 @@ def home_page():
                 with st.spinner("Generating math problems..."):
                     # Generate problems
                     try:
-                        problem_generator = MathProblemGenerator()
+                        problem_generator = MathProblemGenerator(mock_mode=MOCK_MODE)
                         problems = problem_generator.generate_batch(
                             topic, difficulty, int(num_problems)
                         )
@@ -377,7 +384,7 @@ def results_page():
 
             # Ask for more explanation
             if "explanation_model" not in st.session_state:
-                st.session_state.explanation_model = MathExplainer()
+                st.session_state.explanation_model = MathExplainer(mock_mode=MOCK_MODE)
 
             user_query = st.text_input(
                 "Ask for more explanation:",

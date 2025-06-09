@@ -40,6 +40,9 @@ ENV/
 data/cache/
 exam_results_*.json
 
+# Environment variables
+.env
+
 # OS specific
 .DS_Store
 Thumbs.db
