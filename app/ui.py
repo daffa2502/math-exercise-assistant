@@ -7,6 +7,7 @@ from config.settings import (
     DEFAULT_TIME_MINUTES,
     DEFAULT_TOPIC,
     DIFFICULTY_LEVELS,
+    MOCK_MODE,
 )
 from models.explanation_model import MathExplainer
 from models.problem_generator import MathProblemGenerator
@@ -57,20 +58,33 @@ def setup_page():
             border-radius: 10px;
             padding: 20px;
             margin: 10px 0;
+            color: #333333;
+        }
+        .problem-card h3 {
+            color: #1E88E5;
+            margin-bottom: 15px;
+        }
+        .problem-text {
+            color: #333333;
+            font-size: 18px;
+            line-height: 1.6;
+            font-weight: 500;
         }
         .explanation-box {
             background-color: #E3F2FD;
             border-radius: 10px;
             padding: 20px;
-            margin: 10px 0;
+            margin: 15px 0;
         }
         .correct-answer {
             color: #2E7D32;
             font-weight: bold;
+            margin-bottom: 15px;
         }
         .incorrect-answer {
             color: #C62828;
             font-weight: bold;
+            margin-bottom: 15px;
         }
         .stButton>button {
             width: 100%;
@@ -90,6 +104,12 @@ def home_page():
         '<div class="subtitle">Configure your math practice session</div>',
         unsafe_allow_html=True,
     )
+
+    # Show mock mode warning if enabled
+    if MOCK_MODE:
+        st.warning(
+            "🔧 **Running in Mock Mode** - No AI models will be loaded. Using template problems for testing."
+        )
 
     col1, col2 = st.columns(2)
 
@@ -154,7 +174,7 @@ def home_page():
                 with st.spinner("Generating math problems..."):
                     # Generate problems
                     try:
-                        problem_generator = MathProblemGenerator()
+                        problem_generator = MathProblemGenerator(mock_mode=MOCK_MODE)
                         problems = problem_generator.generate_batch(
                             topic, difficulty, int(num_problems)
                         )
@@ -169,10 +189,33 @@ def home_page():
                         st.session_state.show_results = False
 
                         # Force page refresh to show the exercise page
-                        st.experimental_rerun()
+                        st.rerun()
 
                     except Exception as e:
                         st.error(f"Error generating problems: {str(e)}")
+
+
+@st.fragment(run_every=1)
+def timer_display():
+    """Fragment to display and auto-update timer every second"""
+    # Early return if not in exercise mode to stop fragment execution
+    if (
+        "exam_session" not in st.session_state
+        or "page" not in st.session_state
+        or st.session_state.page != "exercise"
+        or st.session_state.get("show_results", False)
+    ):
+        return
+
+    session = st.session_state.exam_session
+    timer_display = session.timer.get_formatted_time()
+    st.markdown(f'<div class="timer">{timer_display}</div>', unsafe_allow_html=True)
+
+    # Check if time's up and trigger results
+    if session.timer.is_time_up():
+        session.end()
+        st.session_state.show_results = True
+        st.rerun()
 
 
 def exercise_page():
@@ -182,6 +225,14 @@ def exercise_page():
     if session.start_time is None:
         session.start()
 
+    # Check if time's up first
+    if session.timer.is_time_up():
+        session.end()
+        st.session_state.show_results = True
+        st.warning("Time's up! Your answers have been submitted.")
+        st.rerun()
+        return
+
     # Display header
     col1, col2, col3 = st.columns([2, 6, 2])
 
@@ -189,7 +240,10 @@ def exercise_page():
         if st.button("⏹️ End Exercise"):
             session.end()
             st.session_state.show_results = True
-            st.experimental_rerun()
+            # Clear any fragment references
+            if "timer_fragment_active" in st.session_state:
+                del st.session_state.timer_fragment_active
+            st.rerun()
 
     with col2:
         st.markdown(
@@ -198,9 +252,9 @@ def exercise_page():
         )
 
     with col3:
-        # Display timer
-        timer_display = session.timer.get_formatted_time()
-        st.markdown(f'<div class="timer">{timer_display}</div>', unsafe_allow_html=True)
+        # Mark timer fragment as active and use the auto-updating timer fragment
+        st.session_state.timer_fragment_active = True
+        timer_display()
 
     # Problem navigation
     problem_nav()
@@ -211,7 +265,7 @@ def exercise_page():
 
     with st.container():
         st.markdown(
-            f'<div class="problem-card"><h3>Problem {current_index + 1}</h3>{problem["problem"]}</div>',
+            f'<div class="problem-card"><h3>Problem {current_index + 1}</h3><div class="problem-text">{problem["problem"]}</div></div>',
             unsafe_allow_html=True,
         )
 
@@ -229,7 +283,7 @@ def exercise_page():
                 type="primary" if is_selected else "secondary",
             ):
                 session.submit_answer(current_index, option_letter)
-                st.experimental_rerun()
+                st.rerun()
 
         # Problem actions
         col1, col2, col3 = st.columns(3)
@@ -237,7 +291,7 @@ def exercise_page():
         with col1:
             if st.button("⬅️ Previous", disabled=current_index == 0):
                 session.move_to_prev()
-                st.experimental_rerun()
+                st.rerun()
 
         with col2:
             flag_status = session.flagged_problems[current_index]
@@ -245,19 +299,12 @@ def exercise_page():
 
             if st.button(flag_text):
                 session.toggle_flag(current_index)
-                st.experimental_rerun()
+                st.rerun()
 
         with col3:
             if st.button("➡️ Next", disabled=current_index == session.num_problems - 1):
                 session.move_to_next()
-                st.experimental_rerun()
-
-    # Check if time's up
-    if session.timer.is_time_up():
-        session.end()
-        st.session_state.show_results = True
-        st.warning("Time's up! Your answers have been submitted.")
-        st.experimental_rerun()
+                st.rerun()
 
 
 def problem_nav():
@@ -289,11 +336,15 @@ def problem_nav():
 
             if st.button(button_text, key=f"nav_{i}", type=button_type):
                 session.move_to_problem(i)
-                st.experimental_rerun()
+                st.rerun()
 
 
 def results_page():
     """Render the results page with explanations"""
+    # Clean up timer fragment state
+    if "timer_fragment_active" in st.session_state:
+        del st.session_state.timer_fragment_active
+
     session = st.session_state.exam_session
     summary = session.get_exam_summary()
 
@@ -322,12 +373,10 @@ def results_page():
 
     # Back to home button
     if st.button("🏠 Back to Home"):
-        # Reset session state
-        for key in list(st.session_state.keys()):
-            if key != "page":
-                del st.session_state[key]
+        # Reset all session state to stop any running fragments
+        st.session_state.clear()
         st.session_state.page = "home"
-        st.experimental_rerun()
+        st.rerun()
 
     # Detailed results for each problem
     st.markdown("## Problem Review")
@@ -370,14 +419,14 @@ def results_page():
                     )
 
             # Explanation
-            st.markdown('<div class="explanation-box">', unsafe_allow_html=True)
+            # st.markdown('<div class="explanation-box">', unsafe_allow_html=True)
             st.markdown("**Explanation:**")
             st.markdown(problem["explanation"])
             st.markdown("</div>", unsafe_allow_html=True)
 
             # Ask for more explanation
             if "explanation_model" not in st.session_state:
-                st.session_state.explanation_model = MathExplainer()
+                st.session_state.explanation_model = MathExplainer(mock_mode=MOCK_MODE)
 
             user_query = st.text_input(
                 "Ask for more explanation:",
@@ -427,7 +476,7 @@ def main():
     else:
         st.error("Invalid page state")
         st.session_state.page = "home"
-        st.experimental_rerun()
+        st.rerun()
 
 
 if __name__ == "__main__":
