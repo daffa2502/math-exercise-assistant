@@ -39,6 +39,7 @@ ENV/
 # Project specific
 data/cache/
 exam_results_*.json
+models/qwen3-1.7b/
 
 # Environment variables
 .env

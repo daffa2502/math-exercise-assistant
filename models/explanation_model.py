@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class MathExplainer:
     """
     A class to provide additional explanations for math problems
-    using a language model.
+    using Qwen3-1.7B model.
     """
 
     def __init__(
@@ -25,7 +25,7 @@ class MathExplainer:
         Initialize the math explainer with the specified model.
 
         Args:
-            model_name: Hugging Face model name/path
+            model_name: Hugging Face model name/path or local path
             device: Device to run the model on ('cuda', 'cpu', etc.)
             mock_mode: If True, skip model loading and use fallback explanations
         """
@@ -46,13 +46,30 @@ class MathExplainer:
 
         logger.info(f"Loading explanation model {model_name} on {self.device}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=CACHE_DIR)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, cache_dir=CACHE_DIR
-        )
-        self.model.to(self.device)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name, cache_dir=CACHE_DIR
+            )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16
+                if torch.cuda.is_available()
+                else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None,
+                cache_dir=CACHE_DIR,
+            )
 
-        logger.info("Model loaded successfully")
+            # Ensure pad token is set
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            logger.info("Explanation model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading explanation model: {e}")
+            logger.info("Falling back to mock mode")
+            self.mock_mode = True
+            self.tokenizer = None
+            self.model = None
 
     def generate_explanation(
         self, problem_data: Dict[str, Any], user_query: str
@@ -75,65 +92,89 @@ class MathExplainer:
         original_explanation = problem_data["explanation"]
         solution = problem_data["solution"]
 
-        # Create prompt for the model
-        prompt = self._create_prompt(
+        # Create prompt for Qwen
+        prompt = self._create_qwen_prompt(
             problem, original_explanation, solution, user_query
         )
 
-        # Generate output from the model
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        try:
+            # Generate output from the model
+            inputs = self.tokenizer(
+                prompt, return_tensors="pt", padding=True, truncation=True
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        with torch.no_grad():
-            output_sequences = self.model.generate(
-                **inputs,
-                max_length=1024,
-                num_return_sequences=1,
-                temperature=0.3,  # Lower temperature for more focused explanations
-                do_sample=True,
-                top_p=0.95,
+            with torch.no_grad():
+                output_sequences = self.model.generate(
+                    **inputs,
+                    max_new_tokens=400,
+                    num_return_sequences=1,
+                    temperature=0.3,  # Lower temperature for more focused explanations
+                    do_sample=True,
+                    top_p=0.95,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+
+            # Decode the output
+            output_text = self.tokenizer.decode(
+                output_sequences[0], skip_special_tokens=True
             )
 
-        # Decode the output
-        output_text = self.tokenizer.decode(
-            output_sequences[0], skip_special_tokens=True
-        )
+            # Remove the prompt from the output
+            explanation = output_text[len(prompt) :].strip()
 
-        # Clean up the output if needed
-        explanation = self._clean_output(output_text)
+            # Clean up the output if needed
+            explanation = self._clean_qwen_output(explanation)
 
-        return explanation
+            return explanation
 
-    def _create_prompt(
+        except Exception as e:
+            logger.error(f"Error generating explanation with Qwen: {e}")
+            return self._create_fallback_explanation(problem_data, user_query)
+
+    def _create_qwen_prompt(
         self, problem: str, original_explanation: str, solution: str, user_query: str
     ) -> str:
-        """Create the prompt for the model"""
-        return (
-            f"Math Problem: {problem}\n\n"
-            f"Solution: {solution}\n\n"
-            f"Original Explanation: {original_explanation}\n\n"
-            f"Student Question: {user_query}\n\n"
-            f"Please provide a more detailed explanation that addresses the student's question:"
-        )
+        """Create the prompt for Qwen model"""
+        return f"""You are a helpful math tutor. A student has asked for additional explanation about a math problem.
 
-    def _clean_output(self, output_text: str) -> str:
-        """Clean up the model output if necessary"""
-        # Remove any potential prefixes like "Here's a detailed explanation:"
+Math Problem: {problem}
+
+Solution: {solution}
+
+Original Explanation: {original_explanation}
+
+Student Question: {user_query}
+
+Please provide a clear, detailed explanation that addresses the student's specific question. Focus on helping them understand the concept better.
+
+"""
+
+    def _clean_qwen_output(self, output_text: str) -> str:
+        """Clean up the Qwen model output if necessary"""
+        # Remove any potential prefixes or suffixes
+        print("Raw output from Qwen:", output_text)
         lines = output_text.split("\n")
         cleaned_lines = []
 
-        # Skip potential prefixes in the first few lines
+        # Skip potential prefixes and empty lines at the beginning
         started_content = False
         for line in lines:
-            if started_content or not (
-                line.startswith("Here")
-                or line.startswith("Let me")
-                or line.startswith("I'll")
-                or line.strip() == ""
+            line = line.strip()
+            if started_content or (
+                line and not line.startswith(("Here", "Let me", "I'll", "Sure"))
             ):
                 started_content = True
-                cleaned_lines.append(line)
+                if line:  # Only add non-empty lines
+                    cleaned_lines.append(line)
 
-        return "\n".join(cleaned_lines) if cleaned_lines else output_text
+        result = "\n".join(cleaned_lines) if cleaned_lines else output_text
+
+        # Limit length to avoid overly long responses
+        if len(result) > 1000:
+            result = result[:1000] + "..."
+
+        return result
 
     def _create_fallback_explanation(
         self, problem_data: Dict[str, Any], user_query: str

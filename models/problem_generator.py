@@ -4,7 +4,7 @@ import random
 from typing import Any, Dict, List, Optional
 
 import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config.settings import CACHE_DIR, PROBLEM_GENERATOR_MODEL
 
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class MathProblemGenerator:
     """
     A class to generate math problems, solutions, explanations, and multiple-choice options
-    using a fine-tuned language model.
+    using Qwen3-1.7B model.
     """
 
     def __init__(
@@ -27,7 +27,7 @@ class MathProblemGenerator:
         Initialize the problem generator with the specified model.
 
         Args:
-            model_name: Hugging Face model name/path
+            model_name: Hugging Face model name/path or local path
             device: Device to run the model on ('cuda', 'cpu', etc.)
             mock_mode: If True, skip model loading and use fallback templates
         """
@@ -46,13 +46,30 @@ class MathProblemGenerator:
 
         logger.info(f"Loading problem generator model {model_name} on {self.device}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=CACHE_DIR)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(
-            model_name, cache_dir=CACHE_DIR
-        )
-        self.model.to(self.device)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name, cache_dir=CACHE_DIR
+            )
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16
+                if torch.cuda.is_available()
+                else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None,
+                cache_dir=CACHE_DIR,
+            )
 
-        logger.info("Model loaded successfully")
+            # Ensure pad token is set
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            logger.info("Model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            logger.info("Falling back to mock mode")
+            self.mock_mode = True
+            self.tokenizer = None
+            self.model = None
 
     def generate_problem(self, topic: str, difficulty: str) -> Dict[str, Any]:
         """
@@ -68,75 +85,157 @@ class MathProblemGenerator:
         if self.mock_mode:
             return self._create_fallback_problem(topic, difficulty)
 
-        # Create the prompt for the model
-        prompt = self._create_prompt(topic, difficulty)
-
-        # Generate output from the model
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-
-        with torch.no_grad():
-            output_sequences = self.model.generate(
-                **inputs,
-                max_length=1024,
-                num_return_sequences=1,
-                temperature=0.7,
-                do_sample=True,
-                top_p=0.9,
-            )
-
-        # Decode and parse the output
-        output_text = self.tokenizer.decode(
-            output_sequences[0], skip_special_tokens=True
-        )
+        # Create the prompt for Qwen
+        prompt = self._create_qwen_prompt(topic, difficulty)
 
         try:
+            # Generate output from the model
+            inputs = self.tokenizer(
+                prompt, return_tensors="pt", padding=True, truncation=True
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            logger.info(
+                f"Generating problem for topic: {topic}, difficulty: {difficulty}"
+            )
+            with torch.no_grad():
+                output_sequences = self.model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    num_return_sequences=1,
+                    temperature=0.7,
+                    do_sample=True,
+                    top_p=0.9,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+
+            # Decode and parse the output
+            output_text = self.tokenizer.decode(
+                output_sequences[0], skip_special_tokens=True
+            )
+
+            # Remove the prompt from the output
+            generated_text = output_text[len(prompt) :].strip()
+
             # Parse the JSON output
-            problem_data = self._parse_output(output_text)
+            problem_data = self._parse_qwen_output(generated_text)
             # Add metadata
             problem_data["metadata"] = {"topic": topic, "difficulty": difficulty}
             return problem_data
+
         except Exception as e:
-            logger.error(f"Error parsing model output: {e}")
-            # Return fallback problem if parsing fails
+            logger.error(f"Error generating problem with Qwen: {e}")
+            # Return fallback problem if generation fails
             return self._create_fallback_problem(topic, difficulty)
 
-    def _create_prompt(self, topic: str, difficulty: str) -> str:
-        """Create the prompt for the model"""
-        return (
-            f"Generate a {difficulty} level {topic} math problem with an explanation, solution, "
-            f"and four multiple-choice options (A, B, C, D), where only one is correct. "
-            f"Format the output as valid JSON with the following fields: "
-            f"'problem', 'solution', 'explanation', 'options', and 'correct_option'. "
-            f"Make the explanation clear and educational, walking through the solution step-by-step."
-        )
+    def _create_qwen_prompt(self, topic: str, difficulty: str) -> str:
+        """Create the prompt for Qwen model"""
+        return f"""Create a {difficulty} level {topic} math problem. Provide the response as a JSON object with these exact fields:
+- "problem": the math question
+- "solution": the correct answer
+- "explanation": step-by-step solution explanation
+- "options": array of 4 multiple choice options in format ["A. option1", "B. option2", "C. option3", "D. option4"]
+- "correct_option": the letter of the correct answer (A, B, C, or D)
 
-    def _parse_output(self, output_text: str) -> Dict[str, Any]:
-        """Parse the model output into a structured format"""
-        # Extract JSON from the output text
-        json_start = output_text.find("{")
-        json_end = output_text.rfind("}")
+Example format:
+{{"problem": "What is 2 + 2?", "solution": "4", "explanation": "Adding 2 + 2 equals 4", "options": ["A. 3", "B. 4", "C. 5", "D. 6"], "correct_option": "B"}}
 
-        if json_start == -1 or json_end == -1:
-            raise ValueError("No valid JSON found in model output")
+Generate one {difficulty} level {topic} math problem. Response should be exactly one valid JSON object without any additional text or formatting.
+"""
 
-        json_text = output_text[json_start : json_end + 1]
+    def _parse_qwen_output(self, output_text: str) -> Dict[str, Any]:
+        """Parse the Qwen model output into a structured format"""
+        try:
+            print(f"Raw output from model: {output_text}")
 
-        # Parse the JSON
-        problem_data = json.loads(json_text)
+            # Clean the output text - remove markdown code blocks if present
+            cleaned_text = output_text.strip()
 
-        # Validate required fields
-        required_fields = [
-            "problem",
-            "solution",
-            "explanation",
-            "options",
-            "correct_option",
-        ]
-        if not all(field in problem_data for field in required_fields):
-            missing = [field for field in required_fields if field not in problem_data]
-            raise ValueError(f"Missing required fields in model output: {missing}")
+            # Remove markdown code block markers
+            if cleaned_text.startswith("```json"):
+                cleaned_text = cleaned_text[7:]  # Remove "```json"
+            if cleaned_text.startswith("```"):
+                cleaned_text = cleaned_text[3:]  # Remove "```"
+            if cleaned_text.endswith("```"):
+                cleaned_text = cleaned_text[:-3]  # Remove trailing "```"
 
-        return problem_data
+            cleaned_text = cleaned_text.strip()
+
+            # Find all potential JSON objects in the text
+            json_objects = []
+            brace_count = 0
+            start_idx = -1
+
+            for i, char in enumerate(cleaned_text):
+                if char == "{":
+                    if brace_count == 0:
+                        start_idx = i
+                    brace_count += 1
+                elif char == "}":
+                    brace_count -= 1
+                    if brace_count == 0 and start_idx != -1:
+                        # Found a complete JSON object
+                        json_candidate = cleaned_text[start_idx : i + 1]
+                        json_objects.insert(0, json_candidate)
+
+            if not json_objects:
+                raise ValueError("No valid JSON objects found in model output")
+
+            # Try to parse each JSON object, starting with the largest one
+            json_objects.sort(key=len, reverse=True)
+
+            for json_text in json_objects:
+                try:
+                    print(f"Trying to parse JSON: {json_text}")
+
+                    # Clean up common issues in generated JSON
+                    json_text = json_text.replace(
+                        "'", '"'
+                    )  # Replace single quotes with double quotes
+                    json_text = json_text.replace('\\"', '"')  # Fix escaped quotes
+
+                    # Parse the JSON
+                    problem_data = json.loads(json_text)
+
+                    # Validate required fields
+                    required_fields = [
+                        "problem",
+                        "solution",
+                        "explanation",
+                        "options",
+                        "correct_option",
+                    ]
+
+                    if not all(field in problem_data for field in required_fields):
+                        print("Missing required fields, trying next JSON object...")
+                        continue
+
+                    # Validate options format
+                    if (
+                        not isinstance(problem_data["options"], list)
+                        or len(problem_data["options"]) != 4
+                    ):
+                        print("Invalid options format, trying next JSON object...")
+                        continue
+
+                    # Validate correct_option
+                    if problem_data["correct_option"] not in ["A", "B", "C", "D"]:
+                        print("Invalid correct_option, trying next JSON object...")
+                        continue
+
+                    print(f"Successfully parsed JSON: {problem_data}")
+                    return problem_data
+
+                except json.JSONDecodeError as je:
+                    print(f"JSON decode error for candidate: {je}")
+                    continue
+
+            # If we get here, none of the JSON objects were valid
+            raise ValueError("No valid JSON objects could be parsed from model output")
+
+        except Exception as e:
+            logger.error(f"Error parsing JSON from Qwen output: {e}")
+            logger.debug(f"Raw output: {output_text}")
+            raise
 
     def _create_fallback_problem(self, topic: str, difficulty: str) -> Dict[str, Any]:
         """Create a fallback problem with comprehensive templates"""
